@@ -1,0 +1,41 @@
+name: scale
+on:
+  workflow_dispatch: {}
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: gen
+        run: |
+          shards=$(ls shards/shard-*.csv | sed 's|shards/||;s|\.csv$||')
+          json=$(printf '%s\n' $shards | jq -R . | jq -cs '{shard: .}')
+          echo "matrix=$json" >> "$GITHUB_OUTPUT"
+          echo "shards: $(printf '%s\n' $shards | wc -l)"
+  verify:
+    needs: setup
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - name: exit IP
+        run: echo "runner IP: $(curl -s --max-time 8 https://api.ipify.org)"
+      - name: verify shard
+        run: |
+          python3 runner_verify.py < "shards/${{ matrix.shard }}.csv" \
+            > "${{ matrix.shard }}.tsv" 2> "${{ matrix.shard }}.diag" || true
+          echo "=== ${{ matrix.shard }} ==="; cat "${{ matrix.shard }}.diag"
+          echo "keepers: $(wc -l < "${{ matrix.shard }}.tsv")"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: keepers-${{ matrix.shard }}
+          path: |
+            ${{ matrix.shard }}.tsv
+            ${{ matrix.shard }}.diag
+          retention-days: 7
