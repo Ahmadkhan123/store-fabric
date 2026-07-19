@@ -1,35 +1,70 @@
 name: scale
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - id: gen
-        run: |
-          shards=$(ls shards/shard-*.csv | sed 's|shards/||;s|\.csv$||')
-          json=$(printf '%s\n' $shards | jq -R . | jq -cs '{shard: .}')
-          echo "matrix=$json" >> "$GITHUB_OUTPUT"
-          echo "shards: $(printf '%s\n' $shards | wc -l)"
   verify:
-    needs: setup
     strategy:
       fail-fast: false
       max-parallel: 20
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      matrix:
+        shard:
+          - shard-000
+          - shard-001
+          - shard-002
+          - shard-003
+          - shard-004
+          - shard-005
+          - shard-006
+          - shard-007
+          - shard-008
+          - shard-009
+          - shard-010
+          - shard-011
+          - shard-012
+          - shard-013
+          - shard-014
+          - shard-015
+          - shard-016
+          - shard-017
+          - shard-018
+          - shard-019
+          - shard-020
+          - shard-021
+          - shard-022
+          - shard-023
+          - shard-024
+          - shard-025
+          - shard-026
+          - shard-027
+          - shard-028
+          - shard-029
+          - shard-030
+          - shard-031
+          - shard-032
+          - shard-033
+          - shard-034
+          - shard-035
+          - shard-036
+          - shard-037
+          - shard-038
+          - shard-039
+          - shard-040
+          - shard-041
+          - shard-042
+          - shard-043
+          - shard-044
+          - shard-045
+          - shard-046
     runs-on: ubuntu-latest
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - name: exit IP
-        run: echo "runner IP: $(curl -s --max-time 8 https://api.ipify.org)"
+        run: |
+          echo "runner IP: $(curl -s --max-time 8 https://api.ipify.org)"
       - name: verify shard
         run: |
-          python3 runner_verify.py < "shards/${{ matrix.shard }}.csv" \
-            > "${{ matrix.shard }}.tsv" 2> "${{ matrix.shard }}.diag" || true
+          python3 runner_verify.py < "shards/${{ matrix.shard }}.csv" > "${{ matrix.shard }}.tsv" 2> "${{ matrix.shard }}.diag" || true
           echo "=== ${{ matrix.shard }} ==="; cat "${{ matrix.shard }}.diag"
           echo "keepers: $(wc -l < "${{ matrix.shard }}.tsv")"
       - uses: actions/upload-artifact@v4
