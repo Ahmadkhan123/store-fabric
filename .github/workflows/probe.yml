@@ -1,0 +1,26 @@
+name: probe
+on:
+  workflow_dispatch:
+    inputs:
+      rate:
+        description: requests/sec per IP
+        default: "2"
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: exit IP
+        run: |
+          echo "runner IP: $(curl -s --max-time 8 https://api.ipify.org)"
+      - name: paced verify probe
+        env:
+          RATE: ${{ github.event.inputs.rate }}
+          WORKERS: "6"
+        run: |
+          python3 runner_verify.py < shards/probe.csv > probe.tsv 2> probe.diag || true
+          echo "=== DIAG (RATE=$RATE) ==="; cat probe.diag
+          echo "keepers: $(wc -l < probe.tsv)"

@@ -1,36 +1,46 @@
 #!/usr/bin/env python3
 # Runs ON a GitHub Actions runner (fresh Azure IP). Verifies a shard of Shopify candidate domains
-# through the locked quality gate using the LIVE products.json only (country is pre-supplied by the
-# pre-crawl, so no homepage fetch needed). stdlib-only (no pip install → fast cold start).
+# through the locked quality gate using the LIVE products.json only (country pre-supplied by pre-crawl).
 #
-# Input:  stdin, one "domain,country" per line (country optional; already English-filtered upstream)
-# Output: stdout, keeper TSV: domain \t country \t products \t score \t phys_frac \t brand
-# Diag:   stderr histogram (keeper / not-store / rate-limited / dead) + sustained rate
+# KEY: Shopify rate-limits per IP (~Retry-After 60s). We PACE requests with a global token bucket
+# (RATE req/s, default 2) so we never blow the budget — concurrency exists only to overlap dead-host
+# timeouts, NOT to burst. Anything still rate-limited (429/conn-reset) is retried after a 65s wait.
 #
-# Burst-then-retry: fire the shard concurrently (fresh IP bucket absorbs it); anything that looks
-# rate-limited (HTTP 429 or connection 000) is RETRIED paced — never counted as a reject.
-import sys, os, json, ssl, time, urllib.request, urllib.error, concurrent.futures as cf
+# Input:  stdin, "domain,country" per line   Output: keeper TSV domain\tcountry\tproducts\tscore\tphys\tbrand
+import sys, os, json, ssl, time, threading, urllib.request, urllib.error, concurrent.futures as cf
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 WEST = {"US", "GB", "CA", "AU", "NZ", "IE"}
 CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
+RATE = float(os.environ.get("RATE", "2"))       # requests/sec per runner (per IP)
+WORKERS = int(os.environ.get("WORKERS", "6"))   # concurrency only to overlap slow/dead hosts
+
+class Bucket:
+    def __init__(self, rate):
+        self.rate = rate; self.tokens = rate; self.last = time.time(); self.lk = threading.Lock()
+    def take(self):
+        while True:
+            with self.lk:
+                now = time.time()
+                self.tokens = min(self.rate, self.tokens + (now - self.last) * self.rate); self.last = now
+                if self.tokens >= 1:
+                    self.tokens -= 1; return
+            time.sleep(0.03)
+BUCKET = Bucket(RATE)
 
 def fetch(d):
-    """returns ('ok', body) | ('rate', None) | ('dead', None)"""
+    BUCKET.take()
     try:
         r = urllib.request.urlopen(
             urllib.request.Request(f"https://{d}/products.json?limit=250", headers={"User-Agent": UA}),
             timeout=12, context=CTX)
-        if r.getcode() == 200:
-            return "ok", r.read(3_000_000)
-        return "dead", None
+        return ("ok", r.read(3_000_000)) if r.getcode() == 200 else ("dead", None)
     except urllib.error.HTTPError as e:
         return ("rate", None) if e.code in (429, 430, 529) else ("dead", None)
     except Exception:
-        return "rate", None      # connection reset / timeout / 000 → retryable, not a reject
+        return "rate", None
 
 def judge(d, country, body):
-    """apply the locked gate to a products.json body; return keeper line or None"""
     try:
         prods = json.loads(body).get("products", [])
     except Exception:
@@ -45,13 +55,13 @@ def judge(d, country, body):
                 if float(v.get("price") or 0) > 0: priced += 1
             except (TypeError, ValueError): pass
             if v.get("requires_shipping"): phys += 1
-    if priced < 3:                          # all-$0 template/placeholder guard
+    if priced < 3:
         return None
     n = len(prods)
     score = 40 + (25 if n >= 1 else 0) + (20 if n >= 10 else 0) + (15 if n >= 50 else 0)
     if score < 85:
         return None
-    if country and country not in WEST:     # english-first (country pre-supplied)
+    if country and country not in WEST:
         return None
     phys_frac = round(phys / tv, 2) if tv else 0.0
     brand = (str(prods[0].get("vendor") or d))[:60].replace("\t", " ").replace("\n", " ")
@@ -62,8 +72,8 @@ def main():
     for l in sys.stdin:
         l = l.strip()
         if not l: continue
-        parts = l.split(",")
-        rows.append((parts[0].strip().lower(), (parts[1].strip().upper() if len(parts) > 1 else "")))
+        p = l.split(",")
+        rows.append((p[0].strip().lower(), (p[1].strip().upper() if len(p) > 1 else "")))
     hist = {"keeper": 0, "not_store": 0, "dead": 0, "rate_final": 0}
     t0 = time.time()
 
@@ -73,13 +83,12 @@ def main():
         if st == "ok":
             line = judge(d, c, body)
             return ("keeper", d, c, line) if line else ("not_store", d, c, None)
-        return (st, d, c, None)   # 'rate' or 'dead'
+        return (st, d, c, None)
 
     pending = rows
-    for rnd in range(4):                     # 1 burst + up to 3 paced retry rounds
+    for rnd in range(4):                      # 1 paced pass + up to 3 retries (65s apart for the 60s window)
         retry = []
-        workers = 16 if rnd == 0 else 5      # burst first (fresh Azure IP, no rate limit), then gentle
-        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
             for kind, d, c, line in ex.map(work, pending):
                 if kind == "keeper":
                     print(line, flush=True); hist["keeper"] += 1
@@ -87,20 +96,17 @@ def main():
                     hist["not_store"] += 1
                 elif kind == "dead":
                     hist["dead"] += 1
-                else:                        # rate → retry next round
+                else:
                     retry.append((d, c))
         if not retry:
             break
-        sys.stderr.write(f"  round {rnd}: {len(retry)} rate-limited, pacing 20s then retry\n"); sys.stderr.flush()
-        time.sleep(20)
+        sys.stderr.write(f"  round {rnd}: {len(retry)} rate-limited, waiting 65s\n"); sys.stderr.flush()
+        time.sleep(65)
         pending = retry
-    hist["rate_final"] = len(pending) if 'retry' in dir() else 0
-    for d, c in (pending if pending else []):
-        pass
+    hist["rate_final"] = len(pending) if pending else 0
     dt = time.time() - t0
     done = hist["keeper"] + hist["not_store"] + hist["dead"]
-    rate = (done / dt * 60) if dt else 0
-    sys.stderr.write(f"[DIAG] {len(rows)} domains in {dt:.0f}s | {hist} | ~{rate:.0f}/min sustained\n")
+    sys.stderr.write(f"[DIAG] {len(rows)} in {dt:.0f}s | {hist} | RATE={RATE} | ~{done/dt*60 if dt else 0:.0f}/min done\n")
 
 if __name__ == "__main__":
     main()
