@@ -1,0 +1,9 @@
+name: one
+on:
+  workflow_dispatch:
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "hello from $(curl -s --max-time 8 https://api.ipify.org)"
