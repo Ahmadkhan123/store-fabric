@@ -63,14 +63,18 @@ jobs:
         run: |
           echo "runner IP: $(curl -s --max-time 8 https://api.ipify.org)"
       - name: verify shard
+        env:
+          ENC_KEY: ${{ secrets.ENC_KEY }}
         run: |
           python3 runner_verify.py < "shards/${{ matrix.shard }}.csv" > "${{ matrix.shard }}.tsv" 2> "${{ matrix.shard }}.diag" || true
           echo "=== ${{ matrix.shard }} ==="; cat "${{ matrix.shard }}.diag"
           echo "keepers: $(wc -l < "${{ matrix.shard }}.tsv")"
+          # encrypt keepers so the public artifact exposes nothing usable; plaintext never uploaded
+          openssl enc -aes-256-cbc -pbkdf2 -md sha256 -pass "pass:$ENC_KEY" -in "${{ matrix.shard }}.tsv" -out "${{ matrix.shard }}.enc"
       - uses: actions/upload-artifact@v4
         with:
           name: keepers-${{ matrix.shard }}
           path: |
-            ${{ matrix.shard }}.tsv
+            ${{ matrix.shard }}.enc
             ${{ matrix.shard }}.diag
           retention-days: 7
